@@ -23,7 +23,8 @@ Interactive mode is recommended for first-time use; fast mode is available once 
 ### Quick Start
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/threeyes3/vps-ssh-harden/main/harden-ssh.sh | sudo bash
+curl -fsSLO https://raw.githubusercontent.com/threeyes3/vps-ssh-harden/main/harden-ssh.sh
+sudo bash harden-ssh.sh
 ```
 
 ### SSH key quick note

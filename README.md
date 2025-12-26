@@ -28,7 +28,8 @@
 **交互式（推荐）**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/threeyes3/vps-ssh-harden/main/harden-ssh.sh | sudo bash
+curl -fsSLO https://raw.githubusercontent.com/threeyes3/vps-ssh-harden/main/harden-ssh.sh
+sudo bash harden-ssh.sh
 ```
 
 **快速运行（非交互）**

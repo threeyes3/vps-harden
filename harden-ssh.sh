@@ -457,7 +457,7 @@ main() {
   have_cmd sshd || die "未找到 sshd（OpenSSH Server）。请先安装 openssh-server。"
 
   local interactive="$DEFAULT_INTERACTIVE"
-  if [[ -t 1 ]]; then
+  if [[ -t 0 ]]; then
     interactive="yes"
   elif [[ "${FORCE_INTERACTIVE:-no}" == "yes" ]]; then
     interactive="yes"
@@ -480,7 +480,7 @@ main() {
 
   # collect inputs
   if [[ "$interactive" == "no" && "${AUTO_PROCEED:-no}" != "yes" ]]; then
-    die "检测到非交互执行。请在交互终端运行，或在确认配置无误后设置 AUTO_PROCEED=yes 以非交互模式继续。"
+    die "检测到非交互执行（例如 curl 管道）。请在交互终端运行，或确认配置无误后设置 AUTO_PROCEED=yes（可配合 FORCE_INTERACTIVE=yes）。"
   fi
 
   if [[ "$interactive" == "yes" ]]; then

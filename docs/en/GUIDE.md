@@ -64,6 +64,7 @@ Optional env vars:
 - `PUBKEY` (inline public key)
 - `GITHUB_KEYS_USER` (fetch keys from GitHub)
 - `AUTO_PROCEED` (yes/no, default no; set yes to allow non-interactive run to continue)
+- `FORCE_INTERACTIVE` (yes/no, default no; set yes to stay interactive when running via pipe like curl | bash)
 
 Note: if neither `PUBKEY` nor `GITHUB_KEYS_USER` is set, the script keeps password auth to prevent lockout.
 

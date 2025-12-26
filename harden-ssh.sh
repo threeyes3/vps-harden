@@ -456,7 +456,13 @@ main() {
   have_cmd sshd || die "未找到 sshd（OpenSSH Server）。请先安装 openssh-server。"
 
   local interactive="$DEFAULT_INTERACTIVE"
-  [[ -t 0 ]] || interactive="no"
+  if [[ -t 1 ]]; then
+    interactive="yes"
+  elif [[ "${FORCE_INTERACTIVE:-no}" == "yes" ]]; then
+    interactive="yes"
+  else
+    interactive="no"
+  fi
 
   # config from defaults
   local current_port; current_port="$(detect_current_sshd_port)"

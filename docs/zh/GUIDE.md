@@ -99,6 +99,7 @@ bash
 - `PUBKEY`：直接传入公钥
 - `GITHUB_KEYS_USER`：从 GitHub 导入公钥
 - `AUTO_PROCEED`：非交互模式下是否自动执行（yes/no，默认 no；设置 yes 才会继续）
+- `FORCE_INTERACTIVE`：在管道运行时强制交互（yes/no，默认 no；例如 curl | bash 时可设为 yes）
 
 说明：若未提供 `PUBKEY` 或 `GITHUB_KEYS_USER`，脚本会为避免锁死 **自动保留密码登录**。
 

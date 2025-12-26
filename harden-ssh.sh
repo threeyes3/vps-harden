@@ -528,7 +528,10 @@ main() {
     fi
 
     validate_port "$new_port" || die "端口不合法：$new_port"
-    ensure_port_free_or_handle "$new_port" "$interactive"
+    # 如果选择保留当前端口，跳过占用检查（因为 sshd 正在用该端口）
+    if [[ "$new_port" != "$current_port" ]]; then
+      ensure_port_free_or_handle "$new_port" "$interactive"
+    fi
   fi
 
   local login_user; login_user="$(detect_default_user)"

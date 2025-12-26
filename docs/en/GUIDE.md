@@ -67,6 +67,16 @@ Note: if neither `PUBKEY` nor `GITHUB_KEYS_USER` is set, the script keeps passwo
 
 ---
 
+## Local Key Helper (one-click, bilingual)
+
+- Use the bundled helpers (double-click, no commands needed):  
+  - macOS/Linux: `tools/local-key-helper.sh`  
+  - Windows: `tools/local-key-helper.ps1`
+- When opened, first choose language (中文/English), then the helper directly runs `ssh-keygen -t ed25519 -C "your_label_here"` to create a new keypair. The `-C` comment is just a label (often an email) to identify the key; it does not affect security. Users can type any label they like.
+- After generation, the helper shows the public key and saves it to an easy place (e.g., Desktop `ssh_public_key.txt`). Copy the whole line and paste it into the VPS script prompt (or upload to GitHub and import).
+
+---
+
 ## Recovery
 
 Restore the SSH configuration backup if needed and restart sshd.

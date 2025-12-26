@@ -1,14 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ============================================
-# VPS SSH Hardening Script (No UFW) - A+B
-# - Interactive (default) or non-interactive via env vars
-# - Adds:
-#   (1) Pre-change summary + sshd_config diff preview
-#   (2) Post-change ready-to-copy SSH command output
-#   (3) Port conflict detection (ss/netstat)
-# ============================================
+# ============================================================
+# VPS SSH Hardening Script (No UFW)
+#
+# AI Notice:
+#   This script is generated and iteratively refined with the assistance of AI (ChatGPT).
+#   Please review and understand the code before using it in production.
+#
+# Goals:
+# - Works on fresh VPS even if SSH keys are NOT deployed yet (guides key deployment)
+# - Interactive (recommended) and non-interactive fast mode
+# - Change SSH port with conflict detection
+# - Optionally disable password login (key-only) with anti-lockout safety
+# - Optional AllowUsers restriction
+# - Install/configure Fail2Ban for sshd
+# - Backup sshd_config, validate with sshd -t
+# - Preview changes (summary + optional diff)
+# - No UFW dependency (cloud security-group friendly)
+# ============================================================
 
 # --------- Defaults (can be overridden by env) ----------
 DEFAULT_PORT="${DEFAULT_PORT:-2222}"
@@ -17,7 +27,7 @@ DEFAULT_ENABLE_FAIL2BAN="${DEFAULT_ENABLE_FAIL2BAN:-yes}"     # yes/no
 DEFAULT_FAIL2BAN_MAXRETRY="${DEFAULT_FAIL2BAN_MAXRETRY:-3}"
 DEFAULT_FAIL2BAN_FINDTIME="${DEFAULT_FAIL2BAN_FINDTIME:-10m}"
 DEFAULT_FAIL2BAN_BANTIME="${DEFAULT_FAIL2BAN_BANTIME:-24h}"
-DEFAULT_ALLOW_USERS="${DEFAULT_ALLOW_USERS:-}"               # e.g. "ubuntu,debian,root" (comma separated)
+DEFAULT_ALLOW_USERS="${DEFAULT_ALLOW_USERS:-}"               # e.g. "ubuntu,debian,root" (comma or space separated)
 DEFAULT_INTERACTIVE="${DEFAULT_INTERACTIVE:-yes}"            # yes/no
 # --------------------------------------------------------
 
@@ -26,10 +36,10 @@ TS="$(date +%Y%m%d_%H%M%S)"
 TMP_DIR="/tmp/harden-ssh"
 mkdir -p "$TMP_DIR"
 
-log() { echo -e "[+] $*"; }
+log()  { echo -e "[+] $*"; }
 warn() { echo -e "[WARN] $*" >&2; }
-err() { echo -e "[ERR] $*" >&2; }
-die() { err "$*"; exit 1; }
+err()  { echo -e "[ERR] $*" >&2; }
+die()  { err "$*"; exit 1; }
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 is_systemd() { have_cmd systemctl; }
@@ -40,39 +50,7 @@ need_root() {
   fi
 }
 
-service_restart_sshd() {
-  if ! is_systemd; then
-    die "当前系统没有 systemd（找不到 systemctl），此脚本暂不支持。"
-  fi
-  if systemctl list-unit-files | grep -q '^sshd\.service'; then
-    systemctl restart sshd
-  elif systemctl list-unit-files | grep -q '^ssh\.service'; then
-    systemctl restart ssh
-  else
-    systemctl restart sshd || systemctl restart ssh
-  fi
-}
-
-detect_default_user() {
-  local u="${SUDO_USER:-root}"
-  echo "$u"
-}
-
-get_home_of_user() {
-  local u="$1"
-  if have_cmd getent; then
-    getent passwd "$u" | awk -F: '{print $6}'
-  else
-    if [[ "$u" == "root" ]]; then echo "/root"; else echo "/home/$u"; fi
-  fi
-}
-
-authorized_keys_exists_for_user() {
-  local u="$1"
-  local h; h="$(get_home_of_user "$u")"
-  [[ -f "$h/.ssh/authorized_keys" ]] && [[ -s "$h/.ssh/authorized_keys" ]]
-}
-
+# -------------------- small helpers --------------------
 prompt() {
   local var_name="$1"
   local question="$2"
@@ -105,12 +83,37 @@ validate_port() {
   return 0
 }
 
-# ---- Port conflict detection ----
+detect_default_user() {
+  # best effort: detect the login user (original user before sudo), fallback to root
+  echo "${SUDO_USER:-root}"
+}
+
+get_home_of_user() {
+  local u="$1"
+  if have_cmd getent; then
+    getent passwd "$u" | awk -F: '{print $6}'
+  else
+    [[ "$u" == "root" ]] && echo "/root" || echo "/home/$u"
+  fi
+}
+
+authorized_keys_exists_for_user() {
+  local u="$1"
+  local h; h="$(get_home_of_user "$u")"
+  [[ -f "$h/.ssh/authorized_keys" ]] && [[ -s "$h/.ssh/authorized_keys" ]]
+}
+
+normalize_allowusers() {
+  local s="$1"
+  s="${s//,/ }"
+  echo "$s" | awk '{$1=$1;print}'
+}
+
+# -------------------- port conflict detection --------------------
 port_in_use() {
   local p="$1"
   # Return 0 if in use, 1 if free, 2 if unknown (no tools)
   if have_cmd ss; then
-    # Check listening tcp sockets on any address (IPv4/IPv6)
     if ss -ltnH 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\\])${p}\$"; then
       return 0
     else
@@ -148,15 +151,135 @@ ensure_port_free_or_handle() {
       die "端口 ${p} 已被占用（已有服务在监听）。请更换 NEW_PORT 后重试。"
     fi
   else
-    # unknown
     warn "无法检测端口占用情况（系统没有 ss 或 netstat）。"
     warn "建议安装：Ubuntu/Debian -> apt install -y iproute2；CentOS/Rocky -> dnf install -y iproute"
-    # Continue, but warn user
     return 0
   fi
 }
-# -------------------------------
 
+# -------------------- key provisioning (NEW) --------------------
+ensure_ssh_key_for_user() {
+  # Ensure target user has at least one public key in authorized_keys.
+  # Supports:
+  # - Interactive paste
+  # - GitHub keys import (https://github.com/<user>.keys)
+  # - Non-interactive via PUBKEY or GITHUB_KEYS_USER env vars
+  #
+  # Return:
+  #   0 -> key ensured
+  #   1 -> not ensured / skipped / failed
+
+  local target_user="$1"
+  local interactive="$2"
+
+  local home_dir; home_dir="$(get_home_of_user "$target_user")"
+  local ssh_dir="${home_dir}/.ssh"
+  local ak="${ssh_dir}/authorized_keys"
+
+  if authorized_keys_exists_for_user "$target_user"; then
+    log "已检测到 ${target_user} 的 authorized_keys"
+    return 0
+  fi
+
+  log "未检测到 ${target_user} 的 authorized_keys，准备引导部署 SSH 公钥..."
+
+  mkdir -p "$ssh_dir"
+  chmod 700 "$ssh_dir"
+  touch "$ak"
+  chmod 600 "$ak"
+
+  if have_cmd chown; then
+    chown -R "${target_user}:${target_user}" "$ssh_dir" 2>/dev/null || true
+  fi
+
+  # Non-interactive
+  if [[ "$interactive" != "yes" ]]; then
+    if [[ -n "${PUBKEY:-}" ]]; then
+      echo "$PUBKEY" >> "$ak"
+      log "已通过环境变量 PUBKEY 写入公钥到 $ak"
+      return 0
+    fi
+
+    if [[ -n "${GITHUB_KEYS_USER:-}" ]]; then
+      if ! have_cmd curl; then
+        err "需要 curl 才能导入 GitHub 公钥（github.com/<user>.keys）。"
+        err "请安装 curl 或改用 PUBKEY 传入公钥。"
+        return 1
+      fi
+
+      local keys=""
+      keys="$(curl -fsSL "https://github.com/${GITHUB_KEYS_USER}.keys" 2>/dev/null || true)"
+      if [[ -z "$keys" ]]; then
+        err "未从 GitHub 获取到任何公钥：https://github.com/${GITHUB_KEYS_USER}.keys"
+        return 1
+      fi
+      echo "$keys" >> "$ak"
+      log "已从 GitHub(${GITHUB_KEYS_USER}) 导入公钥到 $ak"
+      return 0
+    fi
+
+    return 1
+  fi
+
+  # Interactive
+  echo
+  echo "请选择如何为用户 ${target_user} 部署 SSH 公钥："
+  echo "  1) 直接粘贴公钥（一行 ssh-ed25519/ssh-rsa ...）"
+  echo "  2) 从 GitHub 用户名导入（https://github.com/<user>.keys）"
+  echo "  3) 跳过（将保留密码登录，不会禁用密码）"
+  echo
+
+  local choice="1"
+  read -r -p "请输入选项 [1]: " choice || true
+  choice="${choice:-1}"
+
+  case "$choice" in
+    1)
+      echo "请粘贴你的 SSH 公钥（一整行），然后回车："
+      local key_line=""
+      read -r key_line || true
+      if [[ -z "$key_line" ]]; then
+        warn "未输入公钥，部署失败。"
+        return 1
+      fi
+      echo "$key_line" >> "$ak"
+      log "已写入公钥到 $ak"
+      return 0
+      ;;
+    2)
+      if ! have_cmd curl; then
+        warn "系统没有 curl，无法从 GitHub 导入。请先安装 curl 或选择粘贴公钥。"
+        return 1
+      fi
+      local gh=""
+      read -r -p "请输入 GitHub 用户名: " gh || true
+      gh="${gh:-}"
+      if [[ -z "$gh" ]]; then
+        warn "GitHub 用户名为空。"
+        return 1
+      fi
+      local keys=""
+      keys="$(curl -fsSL "https://github.com/${gh}.keys" 2>/dev/null || true)"
+      if [[ -z "$keys" ]]; then
+        warn "未从 GitHub 获取到任何公钥：https://github.com/${gh}.keys"
+        return 1
+      fi
+      echo "$keys" >> "$ak"
+      log "已从 GitHub(${gh}) 导入公钥到 $ak"
+      return 0
+      ;;
+    3)
+      warn "已选择跳过公钥部署。"
+      return 1
+      ;;
+    *)
+      warn "无效选项。"
+      return 1
+      ;;
+  esac
+}
+
+# -------------------- sshd config ops --------------------
 backup_file() {
   local f="$1"
   cp -a "$f" "${f}.bak.${TS}"
@@ -176,16 +299,24 @@ set_sshd_kv() {
 remove_sshd_kv() {
   local key="$1"
   if grep -Ei "^[[:space:]]*${key}[[:space:]]+" "$SSHD_CONFIG" >/dev/null 2>&1; then
-    sed -ri "s|^[[:space:]]*(${key}[[:space:]].*)|# \1|I" "$SSHD_CONFIG"
+    sed -ri "s|^[[:space:]]*(${key}[[:space:]].*)|# \\1|I" "$SSHD_CONFIG"
   fi
 }
 
-normalize_allowusers() {
-  local s="$1"
-  s="${s//,/ }"
-  echo "$s" | awk '{$1=$1;print}'
+service_restart_sshd() {
+  if ! is_systemd; then
+    die "当前系统没有 systemd（找不到 systemctl），此脚本暂不支持。"
+  fi
+  if systemctl list-unit-files | grep -q '^sshd\.service'; then
+    systemctl restart sshd
+  elif systemctl list-unit-files | grep -q '^ssh\.service'; then
+    systemctl restart ssh
+  else
+    systemctl restart sshd || systemctl restart ssh
+  fi
 }
 
+# -------------------- preview helpers --------------------
 print_plan_summary() {
   local login_user="$1"
   local new_port="$2"
@@ -198,7 +329,7 @@ print_plan_summary() {
 
   echo
   echo "========== 变更摘要（即将应用）=========="
-  echo "目标用户（用于给你生成 SSH 命令）: ${login_user}"
+  echo "目标用户（用于生成 SSH 命令）: ${login_user}"
   echo "SSH 端口: 22  ->  ${new_port}"
   echo "密码登录: $( [[ "$disable_password" == "yes" ]] && echo "禁用（仅密钥）" || echo "保留（允许密码）" )"
   if [[ -n "$allow_users" ]]; then
@@ -237,10 +368,11 @@ diff_preview_if_possible() {
   if [[ "$interactive" == "yes" ]]; then
     local cont="yes"
     prompt_yesno cont "确认应用上述修改并重启 SSH 吗" "yes"
-    [[ "$cont" == "yes" ]] || die "已取消执行（未重启 SSH，未写入最终变更）。"
+    [[ "$cont" == "yes" ]] || die "已取消执行。"
   fi
 }
 
+# -------------------- fail2ban --------------------
 fail2ban_install() {
   if have_cmd fail2ban-server; then
     log "fail2ban 已安装"
@@ -283,6 +415,7 @@ EOF
     fi
   fi
 
+  # predictable override block
   cat >>"$jail_local" <<EOF
 
 # ---- managed by harden-ssh.sh (${TS}) ----
@@ -304,15 +437,15 @@ EOF
   log "fail2ban 已启用并重启"
 }
 
+# -------------------- main --------------------
 main() {
   need_root
   have_cmd sshd || die "未找到 sshd（OpenSSH Server）。请先安装 openssh-server。"
 
   local interactive="$DEFAULT_INTERACTIVE"
-  if [[ ! -t 0 ]]; then
-    interactive="no"
-  fi
+  [[ -t 0 ]] || interactive="no"
 
+  # config from defaults
   local new_port="$DEFAULT_PORT"
   local disable_password="$DEFAULT_DISABLE_PASSWORD"
   local enable_fail2ban="$DEFAULT_ENABLE_FAIL2BAN"
@@ -321,8 +454,9 @@ main() {
   local f2b_bantime="$DEFAULT_FAIL2BAN_BANTIME"
   local allow_users_raw="$DEFAULT_ALLOW_USERS"
 
+  # collect inputs
   if [[ "$interactive" == "yes" ]]; then
-    echo "=== SSH 加固脚本（无 UFW，A+B 优化版）==="
+    echo "=== SSH 加固脚本（无 UFW）==="
     echo "提示：云 VPS 请先在安全组放行你将要设置的新端口。"
     echo
 
@@ -333,7 +467,7 @@ main() {
       break
     done
 
-    prompt_yesno disable_password "是否禁用密码登录（强烈推荐）" "$disable_password"
+    prompt_yesno disable_password "是否禁用密码登录（强烈推荐，需确保有公钥）" "$disable_password"
     prompt_yesno enable_fail2ban "是否启用 Fail2Ban（推荐）" "$enable_fail2ban"
 
     if [[ "$enable_fail2ban" == "yes" ]]; then
@@ -342,9 +476,10 @@ main() {
       prompt f2b_bantime "Fail2Ban：bantime（封禁时长，如 24h）" "$f2b_bantime"
     fi
 
-    prompt allow_users_raw "是否限制允许登录的用户（可选，逗号或空格分隔；留空表示不限制）" "$allow_users_raw"
+    prompt allow_users_raw "AllowUsers（可选，逗号或空格分隔；留空表示不限制）" "$allow_users_raw"
     echo
   else
+    # non-interactive: env overrides
     new_port="${NEW_PORT:-$new_port}"
     disable_password="${DISABLE_PASSWORD:-$disable_password}"
     enable_fail2ban="${ENABLE_FAIL2BAN:-$enable_fail2ban}"
@@ -361,55 +496,30 @@ main() {
   local login_home; login_home="$(get_home_of_user "$login_user")"
   log "检测到当前用户：$login_user（home: $login_home）"
 
-  # A) 防锁死检查：禁用密码前确保至少有一套 authorized_keys
+  local allow_users; allow_users="$(normalize_allowusers "$allow_users_raw")"
+
+  # NEW: ensure key before disabling password (works on fresh VPS)
   if [[ "$disable_password" == "yes" ]]; then
-    if authorized_keys_exists_for_user "$login_user"; then
-      log "已检测到 $login_user 的 authorized_keys"
-    elif authorized_keys_exists_for_user "root"; then
-      warn "未检测到 $login_user 的 authorized_keys，但检测到 root 的 authorized_keys。"
-      warn "如果你需要用 $login_user 登录，建议先为该用户配置公钥。"
-      if [[ "$interactive" == "yes" ]]; then
-        local cont=""
-        prompt_yesno cont "仍然继续禁用密码登录吗" "no"
-        if [[ "$cont" != "yes" ]]; then
-          disable_password="no"
-          warn "已改为：允许密码登录（避免锁死）。"
-        fi
-      else
-        warn "非交互模式下，为避免锁死，自动将 DISABLE_PASSWORD 置为 no。"
-        disable_password="no"
-      fi
+    if ensure_ssh_key_for_user "$login_user" "$interactive"; then
+      log "已为 $login_user 准备好 SSH 公钥，可安全禁用密码登录。"
     else
-      warn "未检测到 $login_user 或 root 的 authorized_keys。"
-      if [[ "$interactive" == "yes" ]]; then
-        warn "强烈建议先配置密钥登录，否则禁用密码会锁死。"
-        local cont2=""
-        prompt_yesno cont2 "仍然继续并禁用密码登录吗" "no"
-        if [[ "$cont2" != "yes" ]]; then
-          disable_password="no"
-          warn "已改为：允许密码登录（避免锁死）。"
-        fi
-      else
-        warn "非交互模式下，为避免锁死，自动将 DISABLE_PASSWORD 置为 no。"
-        disable_password="no"
-      fi
+      warn "未能为 $login_user 部署 SSH 公钥。为避免锁死，将自动保留密码登录。"
+      disable_password="no"
     fi
   fi
 
-  local allow_users; allow_users="$(normalize_allowusers "$allow_users_raw")"
-
-  # (1) 变更摘要（执行前）
+  # (1) summary before applying
   print_plan_summary "$login_user" "$new_port" "$disable_password" "$allow_users" \
     "$enable_fail2ban" "$f2b_maxretry" "$f2b_findtime" "$f2b_bantime"
 
-  # 保存修改前副本用于 diff 预览
+  # snapshot for diff preview
   local before_copy="${TMP_DIR}/sshd_config.before.${TS}"
   cp -a "$SSHD_CONFIG" "$before_copy"
 
-  # 备份 sshd_config（可回滚）
+  # backup for rollback
   backup_file "$SSHD_CONFIG"
 
-  # 应用 SSH 配置
+  # apply sshd config
   set_sshd_kv "Port" "$new_port"
   set_sshd_kv "PubkeyAuthentication" "yes"
   set_sshd_kv "AuthorizedKeysFile" ".ssh/authorized_keys"
@@ -440,25 +550,25 @@ main() {
     log "未设置 AllowUsers（不限制登录用户）"
   fi
 
-  # 写入后副本用于 diff
+  # snapshot after applying for diff preview
   local after_copy="${TMP_DIR}/sshd_config.after.${TS}"
   cp -a "$SSHD_CONFIG" "$after_copy"
 
-  # sshd 配置语法检查
+  # validate sshd config
   if sshd -t; then
     log "sshd 配置语法检查通过"
   else
     die "sshd 配置语法检查失败。请用备份回滚：${SSHD_CONFIG}.bak.${TS}"
   fi
 
-  # (1) diff 预览 + 交互确认
+  # (2) diff preview + confirmation
   diff_preview_if_possible "$before_copy" "$after_copy" "$interactive"
 
-  # 重启 sshd
+  # restart sshd
   service_restart_sshd
   log "已重启 SSH 服务"
 
-  # Fail2Ban
+  # fail2ban
   if [[ "$enable_fail2ban" == "yes" ]]; then
     fail2ban_install
     fail2ban_write_jail_local "$new_port" "$f2b_maxretry" "$f2b_findtime" "$f2b_bantime"
@@ -466,7 +576,7 @@ main() {
     log "已跳过 Fail2Ban"
   fi
 
-  # (2) 输出可复制 SSH 命令
+  # (3) print final next steps
   echo
   echo "===== 完成 ====="
   echo "重要：请不要关闭当前 SSH 会话！先在【新终端】测试下面命令："
